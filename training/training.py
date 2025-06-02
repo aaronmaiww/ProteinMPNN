@@ -35,13 +35,7 @@ def main(args):
         if not os.path.exists(base_folder + subfolder):
             os.makedirs(base_folder + subfolder)
 
-    PATH = args.previous_checkpoint
-
-    logfile = base_folder + 'log.txt'
-    if not PATH:
-        with open(logfile, 'w') as f:
-            f.write('Epoch\tTrain\tValidation\n')
-
+    
     data_path = args.path_for_training_data
     params = {
         "LIST"    : f"{data_path}/list.csv", 
@@ -66,12 +60,27 @@ def main(args):
         args.batch_size = 1000
 
     train, valid, test = build_training_clusters(params, args.debug)
-     
+
+    print("built training clusters:", train)    
+
     train_set = PDB_dataset(list(train.keys()), loader_pdb, train, params)
+
+    print("train_set:", train_set[10])
+
     train_loader = torch.utils.data.DataLoader(train_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
     valid_set = PDB_dataset(list(valid.keys()), loader_pdb, valid, params)
     valid_loader = torch.utils.data.DataLoader(valid_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
 
+    print("Length train_loader:", len(train_loader))
+
+    for b in train_loader:
+        print(b)
+        break
+    
+    for b in valid_loader:
+        print(b)
+        break
+  
 
     model = ProteinMPNN(node_features=args.hidden_dim, 
                         edge_features=args.hidden_dim, 
@@ -83,13 +92,11 @@ def main(args):
                         augment_eps=args.backbone_noise)
     model.to(device)
 
-
-    if PATH:
-        checkpoint = torch.load(PATH)
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        total_step = 0
-        epoch = 0
+    WEIGHTS_PATH = args.weights_path
+    weights = torch.load(WEIGHTS_PATH)
+    model.load_state_dict(weights['model_state_dict'])
+    total_step = 0
+    epoch = 0
 
     optimizer = get_std_opt(model.parameters(), args.hidden_dim, total_step)
 
@@ -159,6 +166,7 @@ def main(args):
             
                 train_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
                 train_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
+
                 train_weights += torch.sum(mask_for_loss).cpu().data.numpy()
 
                 total_step += 1

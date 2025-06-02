@@ -315,6 +315,8 @@ def loader_pdb(item,params):
 def build_training_clusters(params, debug):
     val_ids = set([int(l) for l in open(params['VAL']).readlines()])
     test_ids = set([int(l) for l in open(params['TEST']).readlines()])
+
+    print("Val ids:", val_ids)
    
     if debug:
         val_ids = []
@@ -324,10 +326,10 @@ def build_training_clusters(params, debug):
     with open(params['LIST'], 'r') as f:
         reader = csv.reader(f)
         next(reader)
-        rows = [[r[0],r[3],int(r[4])] for r in reader
-                if float(r[2])<=params['RESCUT'] and
-                parser.parse(r[1])<=parser.parse(params['DATCUT'])]
+        rows = [[r[0],r[3],int(r[4])] for r in reader]
     
+    print("Rows when building training cluster:", rows)
+
     # compile training and validation sets
     train = {}
     valid = {}
@@ -352,5 +354,7 @@ def build_training_clusters(params, debug):
             else:
                 train[r[2]] = [r[:2]]
     if debug:
-        valid=train       
+        valid=train  
+
+    print("valid:", valid)     
     return train, valid, test

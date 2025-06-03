@@ -229,7 +229,7 @@ class PDB_dataset(torch.utils.data.Dataset):
 def loader_pdb(item,params):
 
     pdbid,chid = item[0].split('_')
-    PREFIX = "%s/pdb/%s/%s"%(params['DIR'],pdbid[1:3],pdbid)
+    PREFIX = "%s/pdb/%s/%s/%s"%(params['DIR'],pdbid[0:2],pdbid,pdbid)
     
     # load metadata
     if not os.path.isfile(PREFIX+".pt"):
@@ -270,7 +270,8 @@ def loader_pdb(item,params):
     for k in idx:
 
         # pick k-th xform
-        xform = meta['asmb_xform%d'%k]
+        actual_assembly_id = asmb_ids[k]
+        xform = meta['asmb_xform%d'%actual_assembly_id]
         u = xform[:,:3,:3]
         r = xform[:,:3,3]
 

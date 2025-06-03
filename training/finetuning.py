@@ -204,6 +204,532 @@ def load_data_from_loader(data_loader, max_length, num_examples):
     
     return pdb_dict_list
 
+def train_and_validate(
+    model, 
+    optimizer, 
+    scaler, 
+    loader_train, 
+    loader_valid, 
+    device, 
+    epoch,
+    total_step,
+    base_folder,
+    logfile,
+    args,
+    mixed_precision=True,
+    gradient_norm=-1.0,
+    save_checkpoints=True,
+    callbacks=None,
+    verbose=True
+):
+    """
+    Train and validate a ProteinMPNN model for one epoch.
+    
+    Parameters:
+    -----------
+    model : ProteinMPNN
+        The model to train
+    optimizer : optimizer object
+        The optimizer to use for training
+    scaler : GradScaler
+        Gradient scaler for mixed precision training
+    loader_train : StructureLoader
+        DataLoader for training data
+    loader_valid : StructureLoader
+        DataLoader for validation data
+    device : torch.device
+        Device to run training on
+    epoch : int
+        Current epoch number
+    total_step : int
+        Total training steps so far
+    base_folder : str
+        Base folder for saving model weights
+    logfile : str
+        Path to the log file
+    args : object
+        Object containing training arguments
+    mixed_precision : bool
+        Whether to use mixed precision training
+    gradient_norm : float
+        Gradient norm for clipping. If negative, no clipping is applied
+    save_checkpoints : bool
+        Whether to save checkpoints
+    callbacks : list
+        List of callback functions to call after each epoch
+    verbose : bool
+        Whether to print progress
+        
+    Returns:
+    --------
+    tuple
+        (updated_total_step, train_metrics, valid_metrics)
+        where metrics are dictionaries containing perplexity, accuracy, loss
+    """
+    from utils import worker_init_fn, PDB_dataset, StructureDataset, StructureLoader
+    from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinMPNN
+    import time
+    import numpy as np
+    import torch
+    
+    # Initialize metrics
+    train_metrics = {}
+    valid_metrics = {}
+    
+    t0 = time.time()
+    model.train()
+    train_sum, train_weights = 0., 0.
+    train_acc = 0.
+    
+    # Training
+    if verbose:
+        print(f"Training epoch {epoch+1}...")
+    
+    for batch_idx, batch in enumerate(loader_train):
+        if verbose and (batch_idx + 1) % 10 == 0:
+            print(f"  Training batch {batch_idx+1}/{len(loader_train)}")
+            
+        X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
+        optimizer.zero_grad()
+        mask_for_loss = mask*chain_M
+        
+        if mixed_precision:
+            with torch.cuda.amp.autocast():
+                log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+                _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
+    
+            scaler.scale(loss_av_smoothed).backward()
+              
+            if gradient_norm > 0.0:
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
+
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+            _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
+            loss_av_smoothed.backward()
+
+            if gradient_norm > 0.0:
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
+
+            optimizer.step()
+        
+        loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
+    
+        train_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
+        train_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
+        train_weights += torch.sum(mask_for_loss).cpu().data.numpy()
+
+        total_step += 1
+
+    # Validation
+    if verbose:
+        print("Running validation...")
+        
+    model.eval()
+    with torch.no_grad():
+        validation_sum, validation_weights = 0., 0.
+        validation_acc = 0.
+        for batch_idx, batch in enumerate(loader_valid):
+            X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
+            log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
+            mask_for_loss = mask*chain_M
+            loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
+            
+            validation_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
+            validation_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
+            validation_weights += torch.sum(mask_for_loss).cpu().data.numpy()
+    
+    # Calculate metrics
+    train_loss = train_sum / train_weights if train_weights > 0 else float('inf')
+    train_accuracy = train_acc / train_weights if train_weights > 0 else 0
+    train_perplexity = np.exp(train_loss)
+    
+    validation_loss = validation_sum / validation_weights if validation_weights > 0 else float('inf')
+    validation_accuracy = validation_acc / validation_weights if validation_weights > 0 else 0
+    validation_perplexity = np.exp(validation_loss)
+    
+    # Format metrics for printing
+    train_perplexity_str = np.format_float_positional(np.float32(train_perplexity), unique=False, precision=3)     
+    validation_perplexity_str = np.format_float_positional(np.float32(validation_perplexity), unique=False, precision=3)
+    train_accuracy_str = np.format_float_positional(np.float32(train_accuracy), unique=False, precision=3)
+    validation_accuracy_str = np.format_float_positional(np.float32(validation_accuracy), unique=False, precision=3)
+
+    # Calculate elapsed time
+    t1 = time.time()
+    dt = np.format_float_positional(np.float32(t1-t0), unique=False, precision=1) 
+    
+    # Log results
+    log_message = f'epoch: {epoch+1}, step: {total_step}, time: {dt}, train: {train_perplexity_str}, valid: {validation_perplexity_str}, train_acc: {train_accuracy_str}, valid_acc: {validation_accuracy_str}'
+    with open(logfile, 'a') as f:
+        f.write(f'{log_message}\n')
+    
+    if verbose:
+        print(log_message)
+    
+    # Save checkpoint
+    if save_checkpoints:
+        checkpoint_filename_last = base_folder+'model_weights/epoch_last.pt'
+        torch.save({
+                    'epoch': epoch+1,
+                    'step': total_step,
+                    'num_edges': args.num_neighbors,
+                    'noise_level': args.backbone_noise,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.optimizer.state_dict(),
+                    }, checkpoint_filename_last)
+
+        # Save periodic checkpoints
+        if (epoch+1) % args.save_model_every_n_epochs == 0:
+            checkpoint_filename = base_folder+'model_weights/epoch{}_step{}.pt'.format(epoch+1, total_step)
+            torch.save({
+                    'epoch': epoch+1,
+                    'step': total_step,
+                    'num_edges': args.num_neighbors,
+                    'noise_level': args.backbone_noise, 
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.optimizer.state_dict(),
+                    }, checkpoint_filename)
+    
+    # Store metrics
+    train_metrics = {
+        'loss': train_loss,
+        'accuracy': train_accuracy,
+        'perplexity': train_perplexity
+    }
+    
+    valid_metrics = {
+        'loss': validation_loss,
+        'accuracy': validation_accuracy,
+        'perplexity': validation_perplexity
+    }
+    
+    # Call callbacks if provided
+    if callbacks:
+        for callback in callbacks:
+            callback(epoch, train_metrics, valid_metrics, model, optimizer)
+    
+    return total_step, train_metrics, valid_metrics
+
+
+def setup_acidophilic_finetuning(args):
+    """
+    Set up everything needed for acidophilic finetuning.
+    
+    Parameters:
+    -----------
+    args : object
+        Object containing setup arguments
+    
+    Returns:
+    --------
+    dict
+        A dictionary containing all the objects needed for training:
+        - model: The ProteinMPNN model
+        - optimizer: The optimizer
+        - scaler: Gradient scaler for mixed precision
+        - train_loader: DataLoader for training data
+        - valid_loader: DataLoader for validation data
+        - loader_train: StructureLoader for processed training data
+        - loader_valid: StructureLoader for processed validation data
+        - device: The device to run on
+        - base_folder: The base folder for outputs
+        - logfile: The log file path
+        - total_step: The current training step
+        - epoch: The current epoch
+    """
+    import json, time, os, sys, glob
+    import shutil
+    import warnings
+    import numpy as np
+    import torch
+    from torch import optim
+    from torch.utils.data import DataLoader
+    import copy
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import random
+    from utils import worker_init_fn, PDB_dataset, StructureDataset, StructureLoader
+    from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinMPNN
+    
+    # Set up device
+    device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
+    if hasattr(args, 'verbose') and args.verbose:
+        print(f"Using device: {device}")
+    
+    # Set up mixed precision
+    scaler = torch.cuda.amp.GradScaler() if (hasattr(args, 'mixed_precision') and args.mixed_precision) else None
+    
+    # Set up output folder
+    base_folder = time.strftime(args.path_for_outputs, time.localtime())
+    if base_folder[-1] != '/':
+        base_folder += '/'
+    if not os.path.exists(base_folder):
+        os.makedirs(base_folder)
+    subfolders = ['model_weights']
+    for subfolder in subfolders:
+        if not os.path.exists(base_folder + subfolder):
+            os.makedirs(base_folder + subfolder)
+    
+    # Set up logging
+    logfile = base_folder + 'log.txt'
+    if not hasattr(args, 'previous_checkpoint') or not args.previous_checkpoint:
+        with open(logfile, 'w') as f:
+            f.write('Epoch\tTrain\tValidation\n')
+    
+    # Set up data parameters
+    data_path = args.path_for_training_data
+    params = {
+        "VAL": f"{data_path}/validation_proteins.txt",
+        "TEST": f"{data_path}/test_proteins.txt",
+        "DIR": f"{data_path}",
+        "DATCUT": "2030-Jan-01",
+        "RESCUT": args.rescut if hasattr(args, 'rescut') else 3.5,
+        "HOMO": 0.70
+    }
+    
+    # DataLoader parameters
+    LOAD_PARAM = {
+        'batch_size': 1,
+        'shuffle': True,
+        'pin_memory': False,
+        'num_workers': args.num_workers if hasattr(args, 'num_workers') else 4
+    }
+    
+    # Adjust parameters for debug mode
+    if hasattr(args, 'debug') and args.debug:
+        args.num_examples_per_epoch = min(50, args.num_examples_per_epoch if hasattr(args, 'num_examples_per_epoch') else 50)
+        args.max_protein_length = 1000
+        args.batch_size = 1000
+    
+    # Build training clusters
+    if hasattr(args, 'verbose') and args.verbose:
+        print("Building training clusters...")
+    train, valid, test = build_custom_training_clusters(params, args.debug if hasattr(args, 'debug') else False)
+    
+    # Create datasets
+    if hasattr(args, 'verbose') and args.verbose:
+        print("Creating datasets...")
+    train_set = PDB_dataset(list(train.keys()), custom_loader_pdb, train, params)
+    valid_set = PDB_dataset(list(valid.keys()), custom_loader_pdb, valid, params)
+    
+    # Create data loaders
+    train_loader = torch.utils.data.DataLoader(train_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
+    valid_loader = torch.utils.data.DataLoader(valid_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
+    
+    if hasattr(args, 'verbose') and args.verbose:
+        print(f"Training set size: {len(train_set)}")
+        print(f"Validation set size: {len(valid_set)}")
+    
+    # Create model
+    model = ProteinMPNN(
+        node_features=args.hidden_dim if hasattr(args, 'hidden_dim') else 128, 
+        edge_features=args.hidden_dim if hasattr(args, 'hidden_dim') else 128, 
+        hidden_dim=args.hidden_dim if hasattr(args, 'hidden_dim') else 128, 
+        num_encoder_layers=args.num_encoder_layers if hasattr(args, 'num_encoder_layers') else 3, 
+        num_decoder_layers=args.num_encoder_layers if hasattr(args, 'num_encoder_layers') else 3, 
+        k_neighbors=args.num_neighbors if hasattr(args, 'num_neighbors') else 48, 
+        dropout=args.dropout if hasattr(args, 'dropout') else 0.1, 
+        augment_eps=args.backbone_noise if hasattr(args, 'backbone_noise') else 0.2
+    )
+    model.to(device)
+    
+    # Load pre-trained weights if specified
+    total_step = 0
+    epoch = 0
+    
+    if hasattr(args, 'previous_checkpoint') and args.previous_checkpoint:
+        if hasattr(args, 'verbose') and args.verbose:
+            print(f"Loading weights from {args.previous_checkpoint}")
+        checkpoint = torch.load(args.previous_checkpoint)
+        total_step = checkpoint['step']
+        epoch = checkpoint['epoch']
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        optimizer = get_std_opt(model.parameters(), args.hidden_dim if hasattr(args, 'hidden_dim') else 128, total_step)
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    else:
+        optimizer = get_std_opt(model.parameters(), args.hidden_dim if hasattr(args, 'hidden_dim') else 128, total_step)
+    
+    # Load data from loaders
+    if hasattr(args, 'verbose') and args.verbose:
+        print("Loading training data...")
+    pdb_dict_train = load_data_from_loader(
+        train_loader, 
+        args.max_protein_length if hasattr(args, 'max_protein_length') else 1000, 
+        args.num_examples_per_epoch if hasattr(args, 'num_examples_per_epoch') else 1000
+    )
+    if hasattr(args, 'verbose') and args.verbose:
+        print(f"Loaded {len(pdb_dict_train)} training examples")
+    
+    if hasattr(args, 'verbose') and args.verbose:
+        print("Loading validation data...")
+    pdb_dict_valid = load_data_from_loader(
+        valid_loader, 
+        args.max_protein_length if hasattr(args, 'max_protein_length') else 1000, 
+        args.num_examples_per_epoch if hasattr(args, 'num_examples_per_epoch') else 1000
+    )
+    if hasattr(args, 'verbose') and args.verbose:
+        print(f"Loaded {len(pdb_dict_valid)} validation examples")
+    
+    # Create structure datasets
+    dataset_train = StructureDataset(
+        pdb_dict_train, 
+        truncate=None, 
+        max_length=args.max_protein_length if hasattr(args, 'max_protein_length') else 1000
+    )
+    dataset_valid = StructureDataset(
+        pdb_dict_valid, 
+        truncate=None, 
+        max_length=args.max_protein_length if hasattr(args, 'max_protein_length') else 1000
+    )
+    
+    # Create structure loaders
+    loader_train = StructureLoader(dataset_train, batch_size=args.batch_size if hasattr(args, 'batch_size') else 1000)
+    loader_valid = StructureLoader(dataset_valid, batch_size=args.batch_size if hasattr(args, 'batch_size') else 1000)
+    
+    # Return everything needed for training
+    return {
+        'model': model,
+        'optimizer': optimizer,
+        'scaler': scaler,
+        'train_loader': train_loader,  # Original loader for reload
+        'valid_loader': valid_loader,  # Original loader for reload
+        'loader_train': loader_train,  # Processed loader for training
+        'loader_valid': loader_valid,  # Processed loader for validation
+        'device': device,
+        'base_folder': base_folder,
+        'logfile': logfile,
+        'total_step': total_step,
+        'epoch': epoch,
+        'params': params
+    }
+
+
+def run_acidophilic_finetuning(args, callbacks=None):
+    """
+    Run the complete acidophilic finetuning process.
+    
+    Parameters:
+    -----------
+    args : object
+        Object containing training arguments
+    callbacks : list, optional
+        List of callback functions to call after each epoch
+        
+    Returns:
+    --------
+    dict
+        A dictionary containing training results and the trained model
+    """
+    from utils import StructureDataset, StructureLoader
+    import time
+    
+    # Set up everything
+    setup = setup_acidophilic_finetuning(args)
+    
+    model = setup['model']
+    optimizer = setup['optimizer']
+    scaler = setup['scaler']
+    train_loader = setup['train_loader']
+    valid_loader = setup['valid_loader']
+    loader_train = setup['loader_train']
+    loader_valid = setup['loader_valid']
+    device = setup['device']
+    base_folder = setup['base_folder']
+    logfile = setup['logfile']
+    total_step = setup['total_step']
+    epoch = setup['epoch']
+    params = setup['params']
+    
+    # Training history
+    history = {
+        'train_loss': [],
+        'train_accuracy': [],
+        'train_perplexity': [],
+        'valid_loss': [],
+        'valid_accuracy': [],
+        'valid_perplexity': []
+    }
+    
+    # Training loop
+    verbose = args.verbose if hasattr(args, 'verbose') else True
+    if verbose:
+        print("Starting training...")
+        
+    for e in range(args.num_epochs if hasattr(args, 'num_epochs') else 100):
+        # Run one epoch of training and validation
+        total_step, train_metrics, valid_metrics = train_and_validate(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            loader_train=loader_train,
+            loader_valid=loader_valid,
+            device=device,
+            epoch=epoch + e,
+            total_step=total_step,
+            base_folder=base_folder,
+            logfile=logfile,
+            args=args,
+            mixed_precision=args.mixed_precision if hasattr(args, 'mixed_precision') else True,
+            gradient_norm=args.gradient_norm if hasattr(args, 'gradient_norm') else -1.0,
+            save_checkpoints=True,
+            callbacks=callbacks,
+            verbose=verbose
+        )
+        
+        # Update history
+        history['train_loss'].append(train_metrics['loss'])
+        history['train_accuracy'].append(train_metrics['accuracy'])
+        history['train_perplexity'].append(train_metrics['perplexity'])
+        history['valid_loss'].append(valid_metrics['loss'])
+        history['valid_accuracy'].append(valid_metrics['accuracy'])
+        history['valid_perplexity'].append(valid_metrics['perplexity'])
+        
+        # Reload data if needed
+        if hasattr(args, 'reload_data_every_n_epochs') and (epoch + e + 1) % args.reload_data_every_n_epochs == 0 and (epoch + e + 1) < (epoch + args.num_epochs):
+            if verbose:
+                print("Reloading training data...")
+            pdb_dict_train = load_data_from_loader(
+                train_loader, 
+                args.max_protein_length if hasattr(args, 'max_protein_length') else 1000, 
+                args.num_examples_per_epoch if hasattr(args, 'num_examples_per_epoch') else 1000
+            )
+            dataset_train = StructureDataset(
+                pdb_dict_train, 
+                truncate=None, 
+                max_length=args.max_protein_length if hasattr(args, 'max_protein_length') else 1000
+            )
+            loader_train = StructureLoader(
+                dataset_train, 
+                batch_size=args.batch_size if hasattr(args, 'batch_size') else 1000
+            )
+    
+    # Save final model
+    final_model_path = base_folder + 'model_weights/final_model.pt'
+    torch.save({
+        'epoch': epoch + args.num_epochs if hasattr(args, 'num_epochs') else 100,
+        'step': total_step,
+        'num_edges': args.num_neighbors if hasattr(args, 'num_neighbors') else 48,
+        'noise_level': args.backbone_noise if hasattr(args, 'backbone_noise') else 0.2,
+        'model_state_dict': model.state_dict()
+    }, final_model_path)
+    
+    if verbose:
+        print(f"Training completed. Final model saved to: {final_model_path}")
+    
+    # Return results
+    return {
+        'model': model,
+        'history': history,
+        'final_model_path': final_model_path,
+        'base_folder': base_folder,
+        'total_steps': total_step
+    }
+
+
 def main(args):
     import json, time, os, sys, glob
     import shutil
@@ -221,225 +747,9 @@ def main(args):
     import subprocess 
     from utils import worker_init_fn, PDB_dataset, StructureDataset, StructureLoader
     from model_utils import featurize, loss_smoothed, loss_nll, get_std_opt, ProteinMPNN
-
-    scaler = torch.cuda.amp.GradScaler()
-     
-    device = torch.device("cuda:0" if (torch.cuda.is_available()) else "cpu")
-    print(f"Using device: {device}")
-
-    base_folder = time.strftime(args.path_for_outputs, time.localtime())
-
-    if base_folder[-1] != '/':
-        base_folder += '/'
-    if not os.path.exists(base_folder):
-        os.makedirs(base_folder)
-    subfolders = ['model_weights']
-    for subfolder in subfolders:
-        if not os.path.exists(base_folder + subfolder):
-            os.makedirs(base_folder + subfolder)
-
-    PATH = args.previous_checkpoint
-
-    logfile = base_folder + 'log.txt'
-    if not PATH:
-        with open(logfile, 'w') as f:
-            f.write('Epoch\tTrain\tValidation\n')
-
-    data_path = args.path_for_training_data
-    params = {
-        "VAL": f"{data_path}/validation_proteins.txt",
-        "TEST": f"{data_path}/test_proteins.txt",
-        "DIR": f"{data_path}",
-        "DATCUT": "2030-Jan-01",
-        "RESCUT": args.rescut, #resolution cutoff for PDBs
-        "HOMO": 0.70 #min seq.id. to detect homo chains
-    }
-
-    LOAD_PARAM = {'batch_size': 1,
-                  'shuffle': True,
-                  'pin_memory': False,
-                  'num_workers': 4}
-
-   
-    if args.debug:
-        args.num_examples_per_epoch = 50
-        args.max_protein_length = 1000
-        args.batch_size = 1000
-
-    print("Building training clusters...")
-    train, valid, test = build_custom_training_clusters(params, args.debug)
-
-    print("Creating training dataset...")
-    train_set = PDB_dataset(list(train.keys()), custom_loader_pdb, train, params)
     
-    # Test sample
-    print("Sample training item:", train_set[0])
-
-    train_loader = torch.utils.data.DataLoader(train_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
-    valid_set = PDB_dataset(list(valid.keys()), custom_loader_pdb, valid, params)
-    valid_loader = torch.utils.data.DataLoader(valid_set, worker_init_fn=worker_init_fn, **LOAD_PARAM)
-
-    print("Length train_loader:", len(train_loader))
-
-    # Check a batch
-    for b in train_loader:
-        print("Batch Trainloader example:", {k: type(v) for k, v in b.items()})
-        break
-    
-    # Create the model
-    model = ProteinMPNN(node_features=args.hidden_dim, 
-                    edge_features=args.hidden_dim, 
-                    hidden_dim=args.hidden_dim, 
-                    num_encoder_layers=args.num_encoder_layers, 
-                    num_decoder_layers=args.num_encoder_layers, 
-                    k_neighbors=args.num_neighbors, 
-                    dropout=args.dropout, 
-                    augment_eps=args.backbone_noise)
-    model.to(device)
-
-    # Load pre-trained weights if specified
-    if PATH:
-        print(f"Loading weights from {PATH}")
-        checkpoint = torch.load(PATH)
-        total_step = checkpoint['step'] #write total_step from the checkpoint
-        epoch = checkpoint['epoch'] #write epoch from the checkpoint
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer = get_std_opt(model.parameters(), args.hidden_dim, total_step)
-            optimizer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    else:
-        total_step = 0
-        epoch = 0
-        optimizer = get_std_opt(model.parameters(), args.hidden_dim, total_step)
-
-    # Load data directly from loaders
-    print("Loading training data...")
-    pdb_dict_train = load_data_from_loader(train_loader, args.max_protein_length, args.num_examples_per_epoch)
-    print(f"Loaded {len(pdb_dict_train)} training examples")
-    
-    print("Loading validation data...")  
-    pdb_dict_valid = load_data_from_loader(valid_loader, args.max_protein_length, args.num_examples_per_epoch)
-    print(f"Loaded {len(pdb_dict_valid)} validation examples")
-      
-    dataset_train = StructureDataset(pdb_dict_train, truncate=None, max_length=args.max_protein_length) 
-    dataset_valid = StructureDataset(pdb_dict_valid, truncate=None, max_length=args.max_protein_length)
-    
-    loader_train = StructureLoader(dataset_train, batch_size=args.batch_size)
-    loader_valid = StructureLoader(dataset_valid, batch_size=args.batch_size)
-    
-    # Training loop
-    for e in range(args.num_epochs):
-        t0 = time.time()
-        e = epoch + e
-        model.train()
-        train_sum, train_weights = 0., 0.
-        train_acc = 0.
-        
-        for _, batch in enumerate(loader_train):
-            start_batch = time.time()
-            X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
-            elapsed_featurize = time.time() - start_batch
-            optimizer.zero_grad()
-            mask_for_loss = mask*chain_M
-            
-            if args.mixed_precision:
-                with torch.cuda.amp.autocast():
-                    log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
-                    _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
-        
-                scaler.scale(loss_av_smoothed).backward()
-                  
-                if args.gradient_norm > 0.0:
-                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
-
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
-                _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
-                loss_av_smoothed.backward()
-
-                if args.gradient_norm > 0.0:
-                    total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_norm)
-
-                optimizer.step()
-            
-            loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
-        
-            train_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
-            train_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
-
-            train_weights += torch.sum(mask_for_loss).cpu().data.numpy()
-
-            total_step += 1
-
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            validation_sum, validation_weights = 0., 0.
-            validation_acc = 0.
-            for _, batch in enumerate(loader_valid):
-                X, S, mask, lengths, chain_M, residue_idx, mask_self, chain_encoding_all = featurize(batch, device)
-                log_probs = model(X, S, mask, chain_M, residue_idx, chain_encoding_all)
-                mask_for_loss = mask*chain_M
-                loss, loss_av, true_false = loss_nll(S, log_probs, mask_for_loss)
-                
-                validation_sum += torch.sum(loss * mask_for_loss).cpu().data.numpy()
-                validation_acc += torch.sum(true_false * mask_for_loss).cpu().data.numpy()
-                validation_weights += torch.sum(mask_for_loss).cpu().data.numpy()
-        
-        # Calculate metrics
-        train_loss = train_sum / train_weights
-        train_accuracy = train_acc / train_weights
-        train_perplexity = np.exp(train_loss)
-        validation_loss = validation_sum / validation_weights
-        validation_accuracy = validation_acc / validation_weights
-        validation_perplexity = np.exp(validation_loss)
-        
-        train_perplexity_ = np.format_float_positional(np.float32(train_perplexity), unique=False, precision=3)     
-        validation_perplexity_ = np.format_float_positional(np.float32(validation_perplexity), unique=False, precision=3)
-        train_accuracy_ = np.format_float_positional(np.float32(train_accuracy), unique=False, precision=3)
-        validation_accuracy_ = np.format_float_positional(np.float32(validation_accuracy), unique=False, precision=3)
-
-        t1 = time.time()
-        dt = np.format_float_positional(np.float32(t1-t0), unique=False, precision=1) 
-        
-        # Log results
-        log_message = f'epoch: {e+1}, step: {total_step}, time: {dt}, train: {train_perplexity_}, valid: {validation_perplexity_}, train_acc: {train_accuracy_}, valid_acc: {validation_accuracy_}'
-        with open(logfile, 'a') as f:
-            f.write(f'{log_message}\n')
-        print(log_message)
-        
-        # Save checkpoint
-        checkpoint_filename_last = base_folder+'model_weights/epoch_last.pt'
-        torch.save({
-                    'epoch': e+1,
-                    'step': total_step,
-                    'num_edges' : args.num_neighbors,
-                    'noise_level': args.backbone_noise,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.optimizer.state_dict(),
-                    }, checkpoint_filename_last)
-
-        # Save periodic checkpoints
-        if (e+1) % args.save_model_every_n_epochs == 0:
-            checkpoint_filename = base_folder+'model_weights/epoch{}_step{}.pt'.format(e+1, total_step)
-            torch.save({
-                    'epoch': e+1,
-                    'step': total_step,
-                    'num_edges' : args.num_neighbors,
-                    'noise_level': args.backbone_noise, 
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.optimizer.state_dict(),
-                    }, checkpoint_filename)
-
-        # Reload data periodically if needed
-        if (e+1) % args.reload_data_every_n_epochs == 0 and e+1 < args.num_epochs:
-            print("Reloading training data...")
-            pdb_dict_train = load_data_from_loader(train_loader, args.max_protein_length, args.num_examples_per_epoch)
-            dataset_train = StructureDataset(pdb_dict_train, truncate=None, max_length=args.max_protein_length)
-            loader_train = StructureLoader(dataset_train, batch_size=args.batch_size)
+    # Just call run_acidophilic_finetuning with the provided args
+    run_acidophilic_finetuning(args)
 
 
 if __name__ == "__main__":
